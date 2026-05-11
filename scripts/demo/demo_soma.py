@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E402, I001
 import argparse
+import copy
 import os
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -60,6 +61,25 @@ from gem.utils.kp2d_utils import smooth_bbx_xyxy, render_2d_keypoints
 CRF = 23  # 17 is lossless, +6 halves output size
 
 
+class _AttrDict:
+    """Minimal Hydra-cfg-compatible namespace used in folder-mode processing.
+
+    Supports attribute access (cfg.video_path) and dict-style .get() so that
+    existing functions (run_preprocess, load_data_dict, render_*) work without
+    modification.
+    """
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if isinstance(v, dict):
+                setattr(self, k, _AttrDict(**v))
+            else:
+                setattr(self, k, v)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
 def _open_cv2_writer(path, width, height, fps):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -68,7 +88,19 @@ def _open_cv2_writer(path, width, height, fps):
 
 def _parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, required=True)
+    # Single-video mode (mutually exclusive with --folder)
+    parser.add_argument("--video", type=str, default=None,
+                        help="Path to a single input video (.mp4)")
+    # Folder / dataset mode
+    parser.add_argument(
+        "--folder", type=str, default=None,
+        help=(
+            "Dataset root folder.  Expected layout: "
+            "folder/<genre>/<music>/video/*.mp4  "
+            "Outputs are written as: "
+            "folder/<genre>/<music>/{keypoints,bodymodel,merge_video}/<segment>.pkl"
+        ),
+    )
     parser.add_argument("--output_root", type=str, default="outputs/demo_soma")
     parser.add_argument("-s", "--static_cam", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -79,6 +111,7 @@ def _parse_args():
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--exp", type=str, default="gem_soma_regression")
     parser.add_argument("--retarget", action="store_true", help="Retarget SOMA motion to G1 robot")
+    parser.add_argument("--force", action="store_true", help="Re-process segments even if outputs already exist")
     return parser.parse_args()
 
 
@@ -375,7 +408,7 @@ def render_global_o3d(cfg, fps=30):
     _, width, height = get_video_lwh(cfg.video_path)
     from gem.utils.cam_utils import create_camera_sensor
 
-    _, _, K = create_camera_sensor(width, height, 24)
+    _, _, K = create_camera_sensor(width, height, 50)
 
     scale, cx, cz = get_ground_params_from_points(joints_glob[:, 0], verts_glob)
     ground = get_ground(max(scale, 3) * 1.5, cx, cz)
@@ -422,8 +455,233 @@ def resolve_ckpt_path(cfg):
     return download_checkpoint()
 
 
+def _make_video_cfg(video_path, preprocess_dir, keypoints_path, bodymodel_path,
+                    merge_video_path, args):
+    """Build a minimal _AttrDict cfg for a single video in folder mode.
+
+    Parameters
+    ----------
+    video_path      : Path to the source .mp4
+    preprocess_dir  : Directory for intermediate files (bbx, vitpose, …)
+    keypoints_path  : Final destination for the keypoints .pkl
+    bodymodel_path  : Final destination for the body-model .pkl (hpe_results)
+    merge_video_path: Final destination for the merged side-by-side .mp4
+    args            : Parsed CLI args (for static_cam, verbose, …)
+    """
+    stem = Path(video_path).stem
+    tmp_dir = Path(preprocess_dir) / stem
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = _AttrDict(
+        bbx=str(tmp_dir / "bbx.pt"),
+        vitpose=str(tmp_dir / "vitpose.pt"),
+        slam=str(tmp_dir / "camera.pt"),
+        vit_features=str(tmp_dir / "vit_features.pt"),
+        hpe_results=str(bodymodel_path),
+        incam_video=str(tmp_dir / f"{stem}_incam.mp4"),
+        global_video=str(tmp_dir / f"{stem}_global.mp4"),
+        incam_global_horiz_video=str(merge_video_path),
+        keypoints=str(keypoints_path),
+    )
+
+    return _AttrDict(
+        video_path=str(video_path),
+        video_name=stem,
+        output_dir=str(tmp_dir),
+        static_cam=args.static_cam,
+        verbose=args.verbose,
+        render_mhr=getattr(args, "render_mhr", False),
+        sam3d_ckpt_path=getattr(args, "sam3d_ckpt_path", None),
+        sam3d_mhr_path=getattr(args, "sam3d_mhr_path", None),
+        paths=paths,
+    )
+
+
+@torch.no_grad()
+def _process_single_video(video_cfg, model):
+    """Run the full GEM-X pipeline on one video using a pre-loaded model.
+
+    Saves:
+      - keypoints .pkl  → vitpose + bbx combined dict
+      - bodymodel .pkl  → full SOMA prediction (body_params_global/incam + K)
+      - merge video     → in-camera and global side-by-side
+    """
+    run_preprocess(video_cfg)
+
+    fps = int(cv2.VideoCapture(video_cfg.video_path).get(cv2.CAP_PROP_FPS) + 0.5) or 30
+
+    # Optional 2D overlay (only when --verbose)
+    if video_cfg.verbose:
+        render_2d_keypoints(
+            video_path=video_cfg.video_path,
+            vitpose_path=video_cfg.paths.vitpose,
+            bbx_path=video_cfg.paths.bbx,
+            output_path=str(Path(video_cfg.output_dir) / "0_kp2d77_overlay.mp4"),
+            fps=fps,
+        )
+
+    data = load_data_dict(video_cfg)
+
+    # --- Keypoints pkl ---
+    keypoints_path = Path(video_cfg.paths.keypoints)
+    if not keypoints_path.exists():
+        kp_data = {
+            **torch.load(video_cfg.paths.bbx),          # bbx_xyxy, bbx_xys
+            "vitpose": torch.load(video_cfg.paths.vitpose),
+        }
+        torch.save(kp_data, str(keypoints_path))
+        Log.info(f"[Output] Keypoints → {keypoints_path}")
+
+    # --- Body model pkl (hpe_results) ---
+    bodymodel_path = Path(video_cfg.paths.hpe_results)
+    if not bodymodel_path.exists():
+        pred = model.predict(data, static_cam=video_cfg.static_cam, postproc=True)
+        torch.save(detach_to_cpu(pred), str(bodymodel_path))
+        Log.info(f"[Output] Body model → {bodymodel_path}")
+
+    # --- Render videos ---
+    render_incam(video_cfg, fps=fps)
+    render_global_o3d(video_cfg, fps=fps)
+
+    # --- Merge video ---
+    merge_video_path = Path(video_cfg.paths.incam_global_horiz_video)
+    if not merge_video_path.exists():
+        merge_videos_horizontal(
+            [video_cfg.paths.incam_video, video_cfg.paths.global_video],
+            str(merge_video_path),
+        )
+        Log.info(f"[Output] Merge video → {merge_video_path}")
+
+
+def run_dataset_folder(folder, args):
+    """Process an entire dataset folder with the GEM-X pipeline.
+
+    Expected dataset layout (produced by main.py / downloader)::
+
+        <folder>/
+          <genre>/
+            <music>/
+              video/
+                seg000.mp4
+                seg001.mp4
+                ...
+
+    Outputs written into the same ``<music>/`` directory::
+
+        <music>/
+          keypoints/          # vitpose + bbx per segment
+            seg000.pt
+          smpl/               # SOMA body params per segment
+            seg000.pt
+          video_merge/        # side-by-side rendered video per segment
+            seg000.mp4
+          preprocess/         # intermediate files (kept for resuming)
+            seg000/
+              bbx.pt
+              vitpose.pt
+              camera.pt
+              vit_features.pt
+
+    Already-processed segments are skipped automatically.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        Log.error(f"[Folder] Dataset folder not found: {folder}")
+        return
+
+    # Discover all video segments in the dataset
+    video_files = sorted(folder.glob("*/*/video/*.mp4"))
+    if not video_files:
+        Log.warning(f"[Folder] No .mp4 files found under {folder}/*/video/")
+        return
+
+    Log.info(f"[Folder] Found {len(video_files)} video(s) across the dataset.")
+
+    # --- Load model ONCE using Hydra via the first video ---
+    args_first = copy.copy(args)
+    args_first.video = str(video_files[0])
+    cfg = _build_cfg(args_first)
+    ckpt_path = resolve_ckpt_path(cfg)
+    model = hydra.utils.instantiate(cfg.model, _recursive_=False)
+    model.load_pretrained_model(ckpt_path)
+    model = model.eval().cuda()
+    Log.info("[Folder] Model loaded. Starting per-video processing...")
+
+    ok, failed = [], []
+
+    for video_path in video_files:
+        # Derive output paths from dataset layout
+        music_dir = video_path.parent.parent      # <folder>/<genre>/<music>/
+        genre_name = music_dir.parent.name
+        music_name = music_dir.name
+        stem = video_path.stem
+
+        preprocess_dir = music_dir / "preprocess"
+        keypoints_dir  = music_dir / "keypoints"
+        bodymodel_dir  = music_dir / "smpl"
+        merge_dir      = music_dir / "video_merge"
+
+        keypoints_path   = keypoints_dir  / f"{stem}.pt"
+        bodymodel_path   = bodymodel_dir  / f"{stem}.pt"
+        merge_video_path = merge_dir      / f"{stem}.mp4"
+
+        # Create output directories
+        for d in [preprocess_dir / stem, keypoints_dir, bodymodel_dir, merge_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Skip if all three final outputs already exist (unless --force)
+        if not args.force and bodymodel_path.exists() and keypoints_path.exists() and merge_video_path.exists():
+            Log.info(f"[Skip] {genre_name}/{music_name}/{stem} — already processed.")
+            ok.append(stem)
+            continue
+
+        if args.force:
+            for p in [keypoints_path, bodymodel_path, merge_video_path]:
+                p.unlink(missing_ok=True)
+            tmp_dir = preprocess_dir / stem
+            for render_file in [tmp_dir / f"{stem}_incam.mp4", tmp_dir / f"{stem}_global.mp4"]:
+                render_file.unlink(missing_ok=True)
+
+        Log.info(f"\n{'─' * 60}")
+        Log.info(f"[Processing] {genre_name}/{music_name}/{stem}")
+
+        video_cfg = _make_video_cfg(
+            video_path=video_path,
+            preprocess_dir=preprocess_dir,
+            keypoints_path=keypoints_path,
+            bodymodel_path=bodymodel_path,
+            merge_video_path=merge_video_path,
+            args=args,
+        )
+
+        try:
+            _process_single_video(video_cfg, model)
+            ok.append(stem)
+        except Exception as exc:
+            Log.error(f"[Error] {genre_name}/{music_name}/{stem}: {exc}")
+            failed.append((genre_name, music_name, stem))
+
+    Log.info(f"\n{'═' * 60}")
+    Log.info(f"[Folder] Done — {len(ok)} succeeded, {len(failed)} failed.")
+    if failed:
+        Log.info("Failed segments:")
+        for g, m, s in failed:
+            Log.info(f"  • {g}/{m}/{s}")
+
+
 def main():
     args = _parse_args()
+
+    # ── Folder / dataset mode ──────────────────────────────────────────────
+    if args.folder:
+        run_dataset_folder(args.folder, args)
+        return
+
+    # ── Single-video mode ──────────────────────────────────────────────────
+    if not args.video:
+        print("[ERROR] Provide either --video <path> or --folder <dataset_root>.")
+        import sys; sys.exit(1)
+
     cfg = _build_cfg(args)
     _copy_video_if_needed(cfg)
     run_preprocess(cfg)

@@ -181,11 +181,12 @@ def resize_and_pad_video(video_path, target_size):
     return temp_path
 
 
-def merge_videos_horizontal(in_video_paths: list, out_video_path: str):
+def merge_videos_horizontal(in_video_paths: list, out_video_path: str, height: int = 720):
     if len(in_video_paths) < 2:
         raise ValueError("At least two video paths are required for merging.")
     inputs = [ffmpeg.input(path) for path in in_video_paths]
-    merged_video = ffmpeg.filter(inputs, "hstack", inputs=len(inputs))
+    scaled = [inp.filter("scale", -2, height) for inp in inputs]
+    merged_video = ffmpeg.filter(scaled, "hstack", inputs=len(scaled))
     output = ffmpeg.output(merged_video, out_video_path)
     ffmpeg.run(output, overwrite_output=True, quiet=True)
 
